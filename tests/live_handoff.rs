@@ -14,8 +14,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use support::{
     cleanup_test_base, client_shell_handshake, register_runtime_dir, register_spawned_herdr_pid,
     send_client_shell_shift_enter, unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap,
-    wait_for_message_variant, wait_for_socket, SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT,
-    SERVER_MESSAGE_SERVER_SHUTDOWN,
+    wait_for_message_variant, wait_for_socket, SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
 
 struct SpawnedHerdr {
@@ -874,15 +873,7 @@ fn live_handoff_preserves_pane_process_io() {
         client_shell_handshake(&mut client_stream, protocol, 54, 23).unwrap();
     assert_eq!(server_protocol, protocol);
     assert!(error.is_none(), "client shell handshake failed: {error:?}");
-    assert!(
-        wait_for_message_variant(
-            &mut client_stream,
-            Duration::from_secs(5),
-            SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT,
-        )
-        .unwrap(),
-        "client shell should receive a complete snapshot before handoff"
-    );
+    wait_for_client_shell_bootstrap(&mut client_stream, Duration::from_secs(5)).unwrap();
 
     assert_ok(request(
         &api_socket,

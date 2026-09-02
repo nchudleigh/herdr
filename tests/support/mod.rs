@@ -382,9 +382,12 @@ pub fn wait_for_message_variants(
     timeout: Duration,
     variants: &[u32],
 ) -> Result<bool, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_millis(200))) {
+        // macOS can reject timeout changes after the peer closes with data buffered.
+        if !(cfg!(target_os = "macos") && err.raw_os_error() == Some(libc::EINVAL)) {
+            return Err(err.to_string());
+        }
+    }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
