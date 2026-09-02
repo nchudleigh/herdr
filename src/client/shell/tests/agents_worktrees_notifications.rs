@@ -1052,6 +1052,7 @@ fn worktree_create_previews_the_endpoint_owned_checkout_path() {
         crate::api::schema::Method::WorktreeCreate(params)
             if params.workspace_id.as_deref() == Some("ws_1")
                 && params.branch.as_deref() == Some("feature/client-shell")
+                && params.base.is_none()
                 && params.path.is_none()
                 && !params.focus
     ));

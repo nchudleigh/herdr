@@ -2,6 +2,15 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_WORKTREE_PREFIX: &str = "worktree";
+const APPLETREE_CONFIG_FILE: &str = ".appletree.toml";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+struct AppletreeConfig {
+    base: Option<String>,
+    copy_files: Vec<String>,
+    post_create: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorktreeCommand {
@@ -321,6 +330,113 @@ pub(crate) fn run_worktree_add_command(
     run_worktree_command(&command)
 }
 
+pub(crate) fn run_worktree_add_with_appletree_config(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+    requested_base: Option<String>,
+    trust_repository: bool,
+) -> Result<(), String> {
+    let config = load_appletree_config(repo_root)?;
+    let base = requested_base
+        .or_else(|| config.base.clone())
+        .unwrap_or_else(|| "HEAD".to_string());
+    run_worktree_add_command(repo_root, path, branch, &base, trust_repository)?;
+    apply_appletree_setup(repo_root, path, branch, &base, &config)
+}
+
+fn load_appletree_config(repo_root: &Path) -> Result<AppletreeConfig, String> {
+    let path = repo_root.join(APPLETREE_CONFIG_FILE);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppletreeConfig::default());
+        }
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    toml::from_str(&content).map_err(|err| format!("invalid {}: {err}", path.display()))
+}
+
+fn apply_appletree_setup(
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    config: &AppletreeConfig,
+) -> Result<(), String> {
+    copy_appletree_files(repo_root, worktree, &config.copy_files)?;
+    run_appletree_post_create(repo_root, worktree, branch, base, &config.post_create)
+}
+
+fn copy_appletree_files(
+    repo_root: &Path,
+    worktree: &Path,
+    patterns: &[String],
+) -> Result<(), String> {
+    for pattern in patterns {
+        let full_pattern = format!("{}/{}", repo_root.display(), pattern);
+        let entries = glob::glob(&full_pattern)
+            .map_err(|err| format!("bad copy_files pattern '{pattern}': {err}"))?;
+        for entry in entries {
+            let source = entry.map_err(|err| err.to_string())?;
+            let relative = source.strip_prefix(repo_root).map_err(|_| {
+                format!(
+                    "copy_files pattern '{pattern}' matched outside repository {}",
+                    repo_root.display()
+                )
+            })?;
+            copy_appletree_path(&source, &worktree.join(relative))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_appletree_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        std::fs::create_dir_all(destination).map_err(|err| err.to_string())?;
+        for entry in std::fs::read_dir(source).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            copy_appletree_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    std::fs::copy(source, destination).map_err(|err| {
+        format!(
+            "copy {} to {} failed: {err}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn run_appletree_post_create(
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    commands: &[String],
+) -> Result<(), String> {
+    for command in commands {
+        let args = ["-c".to_string(), command.clone()];
+        let status = crate::plugin_command::command_for_argv_in_dir("sh", &args, worktree)
+            .env("APPLETREE_WORKTREE", worktree)
+            .env("APPLETREE_BRANCH", branch)
+            .env("APPLETREE_BASE", base)
+            .env("APPLETREE_REPO", repo_root)
+            .status()
+            .map_err(|err| format!("failed to run post_create command '{command}': {err}"))?;
+        if !status.success() {
+            return Err(format!("post_create command failed: {command}"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
     let output = crate::noninteractive_process::command(&command.program)
         // Removal errors are classified by Git's English diagnostics.
@@ -604,6 +720,17 @@ mod tests {
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
         repo
+    }
+
+    fn current_branch(repo: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     #[test]
@@ -984,6 +1111,137 @@ prunable stale
                 "worktree/brave-river"
             ]
         );
+    }
+
+    #[test]
+    fn appletree_config_parses_all_supported_fields() {
+        let repo = unique_temp_path("appletree-config-parse");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(APPLETREE_CONFIG_FILE),
+            r#"
+base = "develop"
+copy_files = [".env*", "config/local.json"]
+post_create = ["mise trust", "direnv allow"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_appletree_config(&repo).unwrap(),
+            AppletreeConfig {
+                base: Some("develop".into()),
+                copy_files: vec![".env*".into(), "config/local.json".into()],
+                post_create: vec!["mise trust".into(), "direnv allow".into()],
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn invalid_appletree_config_stops_before_checkout_creation() {
+        let repo = create_committed_repo("appletree-config-invalid-repo");
+        let checkout = unique_temp_path("appletree-config-invalid-checkout");
+        std::fs::write(repo.join(APPLETREE_CONFIG_FILE), "copy_files = 'nope'\n").unwrap();
+
+        let err = run_worktree_add_with_appletree_config(
+            &repo,
+            &checkout,
+            "worktree/appletree-invalid",
+            None,
+            false,
+        )
+        .expect_err("invalid config should fail worktree creation");
+
+        assert!(err.contains("invalid"));
+        assert!(err.contains(APPLETREE_CONFIG_FILE));
+        assert!(!checkout.exists());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn appletree_config_sets_base_copies_files_and_runs_setup() {
+        let repo = create_committed_repo("appletree-config-setup-repo");
+        let original_branch = current_branch(&repo);
+        run_git(&repo, &["checkout", "--quiet", "-b", "appletree-base"]);
+        std::fs::write(repo.join("from-base.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "from-base.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "base fixture"]);
+        run_git(&repo, &["checkout", "--quiet", &original_branch]);
+        std::fs::write(repo.join(".env.local"), "secret\n").unwrap();
+        std::fs::create_dir_all(repo.join("config/local")).unwrap();
+        std::fs::write(repo.join("config/local/value.txt"), "local\n").unwrap();
+        std::fs::write(
+            repo.join(APPLETREE_CONFIG_FILE),
+            r#"
+base = "appletree-base"
+copy_files = [".env*", "config/local"]
+post_create = [
+  'printf "%s\n%s\n%s\n%s\n" "$APPLETREE_WORKTREE" "$APPLETREE_BRANCH" "$APPLETREE_BASE" "$APPLETREE_REPO" > appletree-env.txt',
+  'printf "done\n" > setup-complete.txt',
+]
+"#,
+        )
+        .unwrap();
+        let checkout = unique_temp_path("appletree-config-setup-checkout");
+        let branch = "worktree/appletree-setup";
+
+        run_worktree_add_with_appletree_config(&repo, &checkout, branch, None, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join(".env.local")).unwrap(),
+            "secret\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("config/local/value.txt")).unwrap(),
+            "local\n"
+        );
+        assert!(checkout.join("from-base.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("setup-complete.txt")).unwrap(),
+            "done\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("appletree-env.txt")).unwrap(),
+            format!(
+                "{}\n{branch}\nappletree-base\n{}\n",
+                checkout.display(),
+                repo.display()
+            )
+        );
+
+        let remove = build_worktree_remove_command(&repo, &checkout, true, false);
+        run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_base_overrides_appletree_config_and_setup_failure_keeps_checkout() {
+        let repo = create_committed_repo("appletree-config-override-repo");
+        std::fs::write(
+            repo.join(APPLETREE_CONFIG_FILE),
+            "base = 'missing-base'\npost_create = ['exit 7']\n",
+        )
+        .unwrap();
+        let checkout = unique_temp_path("appletree-config-override-checkout");
+
+        let err = run_worktree_add_with_appletree_config(
+            &repo,
+            &checkout,
+            "worktree/appletree-override",
+            Some("HEAD".into()),
+            false,
+        )
+        .expect_err("failing setup should fail the operation");
+
+        assert!(err.contains("post_create command failed"));
+        assert!(checkout.join("README.md").exists());
+        let remove = build_worktree_remove_command(&repo, &checkout, true, false);
+        run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

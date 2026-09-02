@@ -267,7 +267,7 @@ impl ClientShellState {
                 workspace_id: Some(workspace_id),
                 cwd: None,
                 branch: Some(branch),
-                base: Some("HEAD".to_owned()),
+                base: None,
                 path: None,
                 label: None,
                 focus: false,

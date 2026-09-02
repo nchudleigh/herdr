@@ -104,6 +104,33 @@ directory = "~/.herdr/worktrees"
 
 Herdr creates checkouts under `<directory>/<repo>/<branch-slug>`. For sibling-style checkouts, set this to a directory such as `~/Projects/herdr-worktrees`. Relative values are resolved to an absolute path when the app applies the config.
 
+Herdr also reads Appletree's `.appletree.toml` from the source repository when
+it creates a worktree:
+
+```toml
+base = "main"
+copy_files = [".env*", "config/local.json"]
+post_create = [
+  "git submodule update --init --recursive",
+  "mise trust",
+]
+```
+
+An explicit `base` supplied through `herdr worktree create --base` or the
+socket API takes precedence over the Appletree `base`. Otherwise, the
+Appletree value replaces Herdr's `HEAD` default. After Git creates the
+checkout, Herdr copies each `copy_files` glob from the source repository while
+preserving relative paths, then runs `post_create` commands in order inside
+the new worktree. Commands stop at the first failure and receive
+`APPLETREE_WORKTREE`, `APPLETREE_BRANCH`, `APPLETREE_BASE`, and
+`APPLETREE_REPO`, matching Appletree. A setup failure leaves the Git worktree
+in place but does not open its Herdr workspace; use `Open worktree...` after
+correcting the setup problem.
+
+`post_create` entries are shell commands run with `sh -c`, as in Appletree.
+Because this executes repository-provided code as your user, inspect
+`.appletree.toml` before creating a worktree from an untrusted repository.
+
 Worktree actions are available from Git workspace rows. `New worktree` creates a checkout. It checks out an existing local branch when the entered branch exists; otherwise, it creates the branch. It then opens the checkout as a new Herdr workspace and groups it under the source workspace. `Open worktree...` lists existing Git worktree checkouts for that repo. Choosing an already-open checkout focuses it, while choosing a closed checkout opens it in the same group.
 
 Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Herdr group, but it does not delete checkout folders or branches.

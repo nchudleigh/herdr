@@ -890,6 +890,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(plugin_root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_api_worktree_create_applies_appletree_config() {
+        let repo = create_committed_repo("api-worktree-appletree-config-repo");
+        let original_branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        let original_branch = String::from_utf8(original_branch.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        run_git(&repo, &["checkout", "--quiet", "-b", "appletree-base"]);
+        std::fs::write(repo.join("from-appletree-base.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "from-appletree-base.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "appletree base"]);
+        run_git(&repo, &["checkout", "--quiet", &original_branch]);
+        std::fs::write(repo.join(".env.local"), "secret\n").unwrap();
+        std::fs::write(
+            repo.join(".appletree.toml"),
+            r#"
+base = "appletree-base"
+copy_files = [".env*"]
+post_create = ['printf "%s" "$APPLETREE_BRANCH" > configured-branch.txt']
+"#,
+        )
+        .unwrap();
+        let worktree_root = unique_temp_path("api-worktree-appletree-config-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    workspace_id: Some(workspace_id),
+                    branch: Some("worktree/appletree-config".into()),
+                    ..WorktreeCreateParams::default()
+                }),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated { worktree, .. } = success.result else {
+            panic!("expected worktree_created response");
+        };
+        let checkout = Path::new(&worktree.path);
+
+        assert!(checkout.join("from-appletree-base.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join(".env.local")).unwrap(),
+            "secret\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("configured-branch.txt")).unwrap(),
+            "worktree/appletree-config"
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let remove = crate::worktree::build_worktree_remove_command(&repo, checkout, true, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
     #[tokio::test]
     async fn deferred_api_worktree_create_checks_out_existing_branch() {
         let repo = create_committed_repo("api-worktree-create-existing-branch-repo");
