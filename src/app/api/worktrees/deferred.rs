@@ -115,7 +115,6 @@ impl App {
             );
             return;
         }
-        let base = params.base.unwrap_or_else(|| "HEAD".into());
         let source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
             Ok(source) => source,
             Err(err) => {
@@ -194,11 +193,11 @@ impl App {
                 Ok(())
             }
             .and_then(|()| {
-                crate::worktree::run_worktree_add_command(
+                crate::worktree::run_worktree_add_with_appletree_config(
                     &source_checkout_path,
                     &path,
                     &branch,
-                    &base,
+                    params.base,
                     params.trust_repository,
                 )
             });
